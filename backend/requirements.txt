@@ -1,0 +1,7 @@
+#Usar api
+fastapi
+uvicorn
+
+#Librerias para tests
+pytest
+httpx

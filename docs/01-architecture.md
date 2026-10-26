@@ -1,102 +1,158 @@
 # Arquitectura del sistema
 
-**Estado:** propuesta inicial para el MVP  
-**Alcance:** plataforma B2B de evaluación de seguridad externa y seguimiento de cumplimiento.  
-**Principio de seguridad:** solo se procesan activos cuya organización haya verificado y autorizado. Las comprobaciones son acotadas, no intrusivas y sujetas a límites de frecuencia y alcance.
+Estado: propuesta inicial para el MVP
+Alcance: plataforma B2B de evaluación de seguridad externa y seguimiento de cumplimiento
+Principio de seguridad: solo se procesan activos cuya organización haya verificado y autorizado. Las comprobaciones son acotadas, no intrusivas y sujetas a límites de frecuencia, alcance y permisos.
 
-## 1. Objetivos y decisiones
+## 1. Objetivo del sistema
 
-La arquitectura debe:
+La plataforma debe permitir a una organización:
 
-- Separar las reglas de negocio de la red, la base de datos y las librerías de escaneo.
-- Responder rápidamente a las peticiones web y ejecutar las evaluaciones fuera del proceso HTTP.
-- Mantener un formato común para los hallazgos de todos los módulos.
-- Aislar los datos de cada organización.
-- Permitir sustituir una cola, una base de datos o un adaptador sin reescribir el dominio.
+- registrar activos digitales bajo su titularidad,
+- solicitar evaluaciones de seguridad y cumplimiento,
+- ejecutar comprobaciones autorizadas en esos activos,
+- conservar evidencia estructurada y hallazgos normalizados,
+- visualizar resultados de forma clara y auditable,
+- separar la lógica de negocio de la infraestructura técnica.
 
-### Decisiones iniciales
+El sistema no debe depender de librerías externas para decidir la lógica de negocio ni para autorizar evaluaciones. La evaluación de cumplimiento debe basarse en reglas explícitas, verificables y reproducibles.
 
-| Área | Propuesta para el MVP | Motivo |
+## 2. Decisiones arquitectónicas del MVP
+
+| Área | Decisión MVP | Motivo |
 |---|---|---|
-| Backend y workers | Python con FastAPI, Pydantic y tipado estático | Desarrollo rápido y ecosistema de seguridad maduro |
-| Persistencia | PostgreSQL | Datos relacionales, transacciones y soporte JSONB |
-| Cola | Redis con una biblioteca de trabajos adecuada al MVP | Operación sencilla para empezar |
-| Frontend | React y TypeScript | Ecosistema amplio para aplicaciones de panel |
-| Ejecución | Contenedores separados para API y workers | Despliegue y escalado independientes |
+| Backend API | Python + FastAPI | Desarrollo rápido, validación sólida, ecosistema maduro |
+| Validación y modelos | Pydantic | Serialización, validación y contratos claros |
+| Persistencia | PostgreSQL | Relacional, transaccional, soporte JSONB para evidencia |
+| Cola / trabajos | Redis + queue library | Sencillo para MVP y desacoplamiento entrante/saliente |
+| Frontend | React + TypeScript | Panel analítico y dashboard de uso frecuente |
+| Worker de escaneo | Procesos separados del API | Aislar la ejecución de comprobaciones y escalar de forma independiente |
+| Lenguaje futuro | Go solo si la carga lo exige | Optimización real, no un cambio “de moda” |
 
-La base de datos es la fuente de verdad para el estado de una evaluación. La cola transporta trabajos; no sustituye el registro persistente de evaluaciones.
+Nota: la intención es construir primero el producto y validar la lógica de negocio. El cambio de lenguaje a Go puede ser una decisión posterior si se demuestra que la concurrencia o el throughput del worker requieren mejor rendimiento.
 
-## 2. Vista general
+## 3. Principios de diseño
+
+### 3.1 Separación de responsabilidades
+La arquitectura debe separar claramente:
+
+- Dominio: reglas, estado y decisiones de negocio
+- Puertos: interfaces que define la aplicación
+- Adaptadores: infraestructura concreta (HTTP, PostgreSQL, Redis, comprobaciones)
+- Workers: ejecución asíncrona de evaluaciones
+
+### 3.2 Fuente de verdad
+PostgreSQL será la fuente de verdad del estado de las evaluaciones, activos, hallazgos y permisos. La cola de eventos transporta trabajo, pero no sustituye la persistencia.
+
+### 3.3 Contratos versionados
+La comunicación entre API y workers debe estar basada en contratos explícitos, versionados y validados. Esto evita que un cambio de implementación rompa una evaluación en producción.
+
+### 3.4 Seguridad por defecto
+No se deben aceptar atributos de la request como autoridad suficiente para ejecutar comprobaciones. Todas las decisiones críticas deben validarse con datos persistidos, permisos de organización y alcance autorizado.
+
+## 4. Vista general de la arquitectura
 
 ```text
-[React + TypeScript]
-        |
-        | HTTPS / API
-        v
-[API FastAPI] -------> [PostgreSQL]
-        |                    ^
-        | publica trabajo    | resultados y estado
-        v                    |
-   [Cola Redis] ------> [Workers aislados]
-                             |
-                             v
-                   [Adaptadores de comprobación]
+[Frontend React + TypeScript]
+              |
+              | HTTPS / API
+              v
+[API FastAPI]
+      |  \
+      |   \---> [PostgreSQL]
+      |
+      | publica trabajo
+      v
+[Queue / Redis]
+      |
+      v
+[Workers de evaluación]
+      |
+      +--> [Adaptadores de comprobación]
+      |
+      +--> [Persistencia de hallazgos y estado]
 ```
 
-La API y los workers comparten los contratos de comunicación, pero no tienen que compartir infraestructura interna. La API gestiona usuarios, organizaciones, permisos y solicitudes. Los workers ejecutan trabajos autorizados y persistien resultados mediante puertos definidos.
+La API gestiona autenticación, autorización, usuarios, organizaciones, activos y peticiones. Los workers son responsables de ejecutar evaluaciones autorizadas y almacenar resultados en base de datos. El dominio no debe conocer ni Redis ni HTTP ni bibliotecas de terceros.
 
-## 3. Arquitectura hexagonal
+## 5. Arquitectura hexagonal
 
-El núcleo de negocio no debe importar FastAPI, Redis, un ORM, librerías de red ni herramientas externas.
+### 5.1 Dominio
+El dominio contiene la lógica central del negocio, incluyendo:
 
-### Dominio
+- organizaciones,
+- usuarios y permisos,
+- activos,
+- evaluaciones,
+- estados de ejecución,
+- hallazgos,
+- severidades,
+- reglas de traducción de evidencia técnica a resultado de cumplimiento.
 
-Contiene conceptos y reglas independientes de la infraestructura:
+El dominio no debe:
 
-- Organización, usuario, activo y evaluación.
-- Estados de evaluación: `queued`, `running`, `completed`, `failed` y `cancelled`.
-- Hallazgos, severidad y reglas de evaluación.
-- Reglas que convierten evidencia técnica en resultados de cumplimiento.
+- hacer llamadas HTTP,
+- importar librerías de escaneo,
+- accedir directamente a PostgreSQL,
+- depender de FastAPI,
+- mezclar infraestructura con lógica de negocio.
 
-El dominio recibe datos y devuelve decisiones. No realiza conexiones de red ni guarda datos por sí mismo.
+### 5.2 Puertos
+Los puertos defininen las dependencias del dominio, por ejemplo:
 
-### Puertos
+- repositorio de evaluaciones,
+- repositorio de hallazgos,
+- repositorio de activos,
+- publicador de trabajos,
+- verificador de permisos,
+- adaptador de comprobación,
+- reloj / UUID generator si fuera necesario en pruebas.
 
-Interfaces que expresan lo que necesita el dominio o los casos de uso, por ejemplo:
+### 5.3 Adaptadores
+Los adaptadores implementan esas interfaces:
 
-- Repositorio de evaluaciones y hallazgos.
-- Publicador de trabajos.
-- Adaptador para realizar una comprobación de seguridad.
-- Reloj o generador de identificadores, si fueran necesarios para pruebas deterministas.
+- adaptador HTTP: endpoints FastAPI
+- adaptador PostgreSQL: persistencia transaccional
+- adaptador Redis: cola de trabajos
+- adaptadores de comprobación: DNS, TLS, encabezados HTTP, SSL, etc.
+- adaptador frontend: cliente de la API
 
-### Adaptadores
+Una librería externa debe quedar detrás de un adaptador concreto. Así, cambiar la implementación no cambia la lógica del dominio.
 
-Implementaciones concretas de esos puertos:
+## 6. Flujo de una evaluación
 
-- Adaptador HTTP: endpoints FastAPI y validación de entrada.
-- Adaptador PostgreSQL: persistencia y transacciones.
-- Adaptador Redis: publicación y consumo de trabajos.
-- Adaptadores de comprobación: consultas DNS, análisis de TLS u otras comprobaciones aprobadas.
-- Adaptador frontend: cliente de la API.
+1. Un usuario autenticado solicita una evaluación de un activo de su organización.
+2. La API valida que el usuario tiene permiso sobre la organización y sobre el activo.
+3. La API comprueba que el activo esté verificado y dentro del alcance autorizado.
+4. La API crea la evaluación en PostgreSQL con estado queued.
+5. La API publica un evento de trabajo en la cola.
+6. Un worker toma el mensaje, valida el contrato y marca la evaluación como running.
+7. El worker recupera el activo y el alcance autorizado desde la base de datos.
+8. Ejecuta solo los módulos permitidos.
+9. Guarda evidencia y hallazgos en PostgreSQL.
+10. Marca la evaluación como completed o failed, con error operativo explícito cuando corresponda.
+11. El frontend consulta el estado y presenta los resultados.
 
-Una librería externa debe quedar detrás del adaptador correspondiente. Así, cambiar una librería no altera las reglas del dominio.
+La base de datos es la verdad. La cola solo transporta jobs.
 
-## 4. Flujo de una evaluación
+## 7. Reintentos y idempotencia
 
-1. Un usuario autenticado solicita una evaluación de un activo asociado a su organización.
-2. La API verifica que el usuario puede actuar sobre ese activo y que el activo está verificado y dentro del alcance permitido.
-3. La API crea la evaluación en PostgreSQL con estado `queued`.
-4. El trabajo se publica en la cola. Para evitar que una caída entre la transacción de base de datos y la publicación deje evaluaciones atascadas, se recomienda una **outbox transaccional**: registrar el evento junto con la evaluación y publicarlo mediante un proceso independiente.
-5. Un worker toma el trabajo, valida el contrato y marca la evaluación como `running`.
-6. El worker ejecuta únicamente los módulos permitidos y dentro de los límites establecidos.
-7. Guarda hallazgos y evidencia estructurada; finalmente marca la evaluación como `completed` o `failed`, con un error operativo explícito cuando corresponda.
-8. El frontend consulta el estado y presenta los resultados. La API puede añadir notificaciones en una fase posterior.
+Los trabajos deben poder reintentarse de forma segura. Un mensaje duplicado no debe:
 
-Los trabajos deben poder reintentarse de forma segura: procesar dos veces el mismo mensaje no debe duplicar hallazgos ni corromper el estado.
+- duplicar hallazgos,
+- duplicar registros de evaluación,
+- dejar un estado inconsistente.
 
-## 5. Contrato de trabajo
+La solución recomendada es:
 
-El contrato debe versionarse. Los identificadores y el alcance se verifican también contra la base de datos; no se confía en que un mensaje de cola sea autorización suficiente.
+- idempotencia por keys de negocio,
+- guardado de eventos con identificadores únicos,
+- estado de evaluación final consistente,
+- comprobaciones de deduplicación por scan_id, asset_id y module.
+
+## 8. Contrato de trabajo
+
+El contrato debe ir versionado. El worker no debe confiar en el contenido del mensaje para autorizar el trabajo. Debe validar el activo y el alcance desde la base de datos.
 
 ```json
 {
@@ -110,9 +166,18 @@ El contrato debe versionarse. Los identificadores y el alcance se verifican tamb
 }
 ```
 
-El worker recupera de la base de datos el activo y el alcance autorizado asociados a `asset_id`. El mensaje no debe contener tokens JWT, contraseñas, secretos ni instrucciones arbitrarias de ejecución.
+Es importante que el mensaje no contenga:
 
-Cada hallazgo debe seguir un formato común, aunque la evidencia específica de cada módulo pueda variar:
+- JWTs
+- sesiones
+- secretos
+- credenciales
+- parámetros arbitrarios de ejecución
+- instrucciones de shell
+
+## 9. Formato común de hallazgos
+
+Cada hallazgo debe seguir un formato común, aunque la evidencia técnica puede variar por módulo.
 
 ```json
 {
@@ -128,23 +193,23 @@ Cada hallazgo debe seguir un formato común, aunque la evidencia específica de 
 }
 ```
 
-`evidence` es información técnica estructurada y validada. En PostgreSQL puede almacenarse como JSONB, conservando columnas relacionales para filtros, relaciones y consultas frecuentes.
+Esto permite que la capa de resultados sea consistente para la UI, reportes y cumplimiento.
 
-## 6. Datos principales
+## 10. Datos principales
 
-El esquema definitivo se documentará por separado. Como mínimo, el modelo deberá contemplar:
+El esquema debe incluir, como mínimo:
 
-- `organizations`: tenant y configuración.
-- `users`: identidad y estado de cuenta.
-- `organization_memberships`: relación usuario-organización y permisos.
-- `assets`: activos registrados, titularidad, estado de verificación y alcance autorizado.
-- `scans`: organización, activo, estado, fechas y versión del contrato.
-- `findings`: evaluación, módulo, regla, severidad, descripción y evidencia JSONB.
-- `outbox_events`: eventos pendientes de publicar, si se adopta el patrón outbox.
+- organizations
+- users
+- organization_memberships
+- assets
+- scans
+- findings
+- outbox_events
 
-Las consultas de un usuario deben filtrar por la organización derivada de su sesión autenticada, no por un `organization_id` libremente elegido por el cliente. Puede añadirse Row-Level Security de PostgreSQL como defensa adicional, pero no sustituye la autorización correcta en la aplicación.
+La autorización debe derivarse siempre de la sesión autenticada del usuario y de su pertenencia a una organización. El cliente no debe poder “elegir” libremente organization_id como autoridad.
 
-## 7. Organización de carpetas orientativa
+## 11. Organización sugerida de carpetas
 
 ```text
 backend/
@@ -173,32 +238,49 @@ contracts/
   finding.schema.json
 ```
 
-Organizad el frontend por funcionalidades y los módulos de comprobación por adaptador o plugin. Evitad un único archivo que concentre todos los escáneres. La estructura es orientativa: debe seguir el tamaño real del proyecto, no convertirse en capas vacías creadas por anticipado.
+La estructura es orientativa, pero debe mantenerse modular y funcional. No conviene un único archivo que contenga todos los escáneres ni toda la lógica de cumplimiento.
 
-## 8. Seguridad y operación
+## 12. Seguridad y operación
 
-- Verificar la titularidad del dominio antes de habilitar evaluaciones sobre él; por ejemplo, mediante un desafío DNS TXT.
-- Aplicar una lista explícita de activos y módulos autorizados, con límites de frecuencia, concurrencia y tiempo.
-- Rechazar entradas que intenten ampliar el alcance. Validar los destinos de red en el worker y prevenir redirecciones fuera del activo autorizado.
-- No construir comandos de shell concatenando datos del usuario. Preferir APIs de librería; si una herramienta externa fuese imprescindible, invocarla con argumentos separados y permisos mínimos.
-- Ejecutar workers aislados, sin acceso entrante público, con recursos limitados y acceso de red estrictamente necesario.
-- Mantener secretos fuera del repositorio y de los mensajes de cola.
-- Registrar quién inició cada evaluación, sobre qué activo y cuándo; evitar guardar datos personales o evidencia innecesaria.
-- Definir métricas y alertas para trabajos atascados, fallos repetidos y crecimiento de la cola.
+- Verificar la titularidad del dominio antes de permitir la evaluación.
+- Aplicar listas explícitas de activos autorizados y módulos permitidos.
+- Limitar frecuencia, concurrencia, tiempo máximo y alcance de cada comprobación.
+- Validar los destinos de red y evitar redirecciones fuera del activo autorizado.
+- Ejecutar workers aislados con permisos mínimos.
+- No concatenar entradas del usuario en comandos de shell.
+- No guardar secretos dentro de mensajes de cola ni en logs.
+- Registrar quién inició cada evaluación, sobre qué activo y cuándo.
+- Definir alertas para trabajos bloqueados, errores repetidos y crecimiento de la cola.
 
-## 9. Evolución por etapas
+## 13. Evolución por etapas
 
-1. **Walking skeleton:** inicio de sesión, organización, activo verificado, una comprobación inocua, cola, persistencia y visualización del resultado.
-2. **Módulos independientes:** incorporar nuevas comprobaciones con el mismo contrato de salida y alcance autorizado.
-3. **Cumplimiento e histórico:** vincular hallazgos con controles versionados y comparar evaluaciones.
-4. **Escalado:** medir primero; después separar colas, ajustar concurrencia o evaluar workers en Go si existe una necesidad demostrada.
+1. Walking skeleton:
+   - login
+   - organización
+   - activo verificado
+   - una comprobación simple
+   - persistencia
+   - cola
+   - visualización del resultado
 
-## 10. Decisiones pendientes
+2. Módulos independientes:
+   - nuevos módulos con el mismo contrato de salida
+   - alcance y permisos por módulo
 
-- Elegir la biblioteca concreta de cola tras un prototipo pequeño y verificar reintentos, recuperación y observabilidad.
-- Definir el esquema relacional y las políticas de retención de evidencia.
-- Acordar los módulos exactos y los límites de comprobación permitidos para el MVP.
-- Crear ADRs cuando una decisión estructural cambie de forma significativa.
-```
+3. Cumplimiento e historial:
+   - comparación entre evaluaciones
+   - control de versiones de reglas
 
-Una precisión importante: **no asumiría que esta arquitectura ya está implementada**; es una propuesta inicial. Y cambiaría la promesa de “cero conflictos de código” por “reducir conflictos”: separar carpetas ayuda, pero las interfaces, los contratos y la coordinación siguen siendo necesarios.
+4. Escalado:
+   - medir primero
+   - separar colas o workers
+   - cambiar a Go solo si se demuestra necesidad real
+
+## 14. Decisiones pendientes
+
+- elegir la biblioteca exacta de cola tras pruebas pequeñas,
+- definir el esquema relacional final,
+- definir la política de retención de evidencia,
+- establecer los módulos MVP exactos,
+- crear ADRs cuando una decisión estructural cambie de forma significativa.
+
